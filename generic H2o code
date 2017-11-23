@@ -1,0 +1,370 @@
+setwd(desk_path)
+
+dt = fread(file.choose(), sep = '^')
+dt[, Y := factor(Y)]
+
+createData = function(target, ratios = c(0.7, 0.2), seed = 294056) {
+	target = as.numeric(as.character(as.vector(target)))
+	ones = sample(which(target == 1))
+	zeroes = sample(which(target == 0))
+	ones_train = ones[1:round(length(ones) * ratios[1])]
+	zeroes_train = zeroes[1:round(length(zeroes) * ratios[1])]
+	train = sample(c(ones_train, zeroes_train))
+	valid = sample(c(ones[(length(ones_train) + 1) : (length(ones_train) + 1 + round(length(ones) * ratios[2]))], zeroes[(length(zeroes_train) + 1) : (length(zeroes_train) + 1 + round(length(zeroes) * ratios[2]))]))
+	test = sample(setdiff(c(ones, zeroes), c(train, valid)))
+	return(list(train = train, test = test, valid = valid))
+}
+
+index = createData(dt$Y)
+train = dt[index[[1]]]
+test = dt[index[[2]]]
+valid = dt[index[[3]],]
+
+o_train = train
+o_test = test
+o_valid = valid
+
+
+library(h2o)
+h2o.init(nthreads = -1, max_mem_size = '8G')
+
+train = as.h2o(train)
+test = as.h2o(test)
+valid = as.h2o(valid)
+
+
+# Identify predictors and response
+y <- "Y"
+x <- setdiff(names(dt), y)
+
+# splits = h2o.splitFrame(data = dt, ratios = c(0.7, 0.2), seed = 294056)
+# train = splits[[1]]
+# valid = splits[[2]]
+# test = splits[[3]]
+
+# # # Logistic regression # # #
+	print("# # # Logistic regression # # #")
+	fit = h2o.glm(x, y, training_frame = train, 
+		family = 'binomial', 
+		lambda_search = TRUE, 
+		remove_collinear_columns = TRUE,
+		nfolds = 5,
+		validation_frame = valid)
+
+		predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+		original = as.integer(as.vector(test$Y))
+		print(performance(predicted = predicted, original = original))
+
+	# # cv results # #
+	print("# # CV Results - Logistic regression # #")
+	print(paste("Training auc:", h2o.auc(fit, xval = F)))
+	print(paste("Validation auc:", h2o.auc(fit, xval = T)))
+	temp = sapply(sapply(fit@model$cross_validation_models, function(x) x$name), function(x) {
+		predicted = as.integer(as.vector(h2o.predict(h2o.getModel(x), newdata = test)$predict))
+		original = as.integer(as.vector(test$Y))
+		print(performance(predicted = predicted, original = original))
+	})
+
+	# # grid search # #
+	print("# # Grid Search - alpha in Logistic regression # #")
+	alphas = list(list(0), list(.25), list(.5), list(.75), list(1))
+	hyper_params = list(alpha = alphas)
+	grid = h2o.grid('glm', hyper_params = hyper_params, x = x, y = y, training_frame = train, family = 'binomial', lambda_search = TRUE)
+	temp = lapply(grid@model_ids, function(x) {
+		predicted = as.integer(as.vector(h2o.predict(h2o.getModel(x), newdata = test)$predict))
+		original = as.integer(as.vector(test$Y))
+		print(performance(predicted = predicted, original = original))
+	})
+
+# # # naive bayes # # #
+	print("# # # naive bayes # # #")
+	fit = h2o.naiveBayes(x = x, y = y, training_frame = train, model_id = 'naive-bayes-default')
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+# # # random forest # # #
+	print("# # # random forest # # #")
+	fit = h2o.randomForest(x = x, y = y, training_frame = train, ntrees = 500, nfolds = 5, validation_frame = valid, seed = 294056)
+	impFeatures = fit@model$variable_importances$variable[fit@model$variable_importances$percentage >= 0.01]
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+	# # cv results # #
+	print("# # CV Results - random forest # #")
+	print(paste("Training auc:", h2o.auc(fit, xval = F)))
+	print(paste("Validation auc:", h2o.auc(fit, xval = T)))
+	sapply(sapply(fit@model$cross_validation_models, function(x) x$name), function(x) {
+		predicted = as.integer(as.vector(h2o.predict(h2o.getModel(x), newdata = test)$predict))
+		original = as.integer(as.vector(test$Y))
+		print(performance(predicted = predicted, original = original))
+	})
+
+	# # imp features # #
+	print("# # using important features - random forest # #")
+	impFeatures = fit@model$variable_importances$variable[fit@model$variable_importances$percentage >= 0.01]
+	impData = train[, c(impFeatures, y)]
+	imp_x = setdiff(colnames(impData), y)
+	fit = h2o.randomForest(x = imp_x, y = y, training_frame = impData, ntrees = 500)
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+
+	# # use stopping criteria in random forest # #
+	fit = h2o.randomForest(x = x, y = y, training_frame = train, ntrees = 500, validation_frame = valid, seed = 294056,
+			score_tree_interval = 5,      
+            stopping_rounds = 3,          
+            stopping_metric = "logloss",      
+            stopping_tolerance = 0.0005,
+            balance_classes = TRUE,
+			class_sampling_factors = c(0.2, 1))
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+	# # imp features # #
+	print("# # using important features - random forest # #")
+	impFeatures = fit@model$variable_importances$variable[fit@model$variable_importances$percentage >= 0.01]
+	impData = train[, c(impFeatures, y)]
+	imp_x = setdiff(colnames(impData), y)
+	fit = h2o.randomForest(x = imp_x, y = y, training_frame = impData, ntrees = 500)
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+	# # tuning rf # #
+	print("# # Tuning random forest # #")
+	hyper_params <- list()
+	hyper_params$mtries = 1:10
+	hyper_params$max_depth = seq(1, 30, 5)
+	hyper_params$min_rows = seq(10, 50, 5)
+	search_criteria = list(strategy = "RandomDiscrete", max_runtime_secs = 1500, max_models = 20)
+	grid = h2o.grid('randomForest', x = x, search_criteria = search_criteria, y = y, training_frame = train, hyper_params = hyper_params, ntrees = 500, validation_frame = valid)
+	# temp = lapply(grid@model_ids, function(x) {
+	# 	predicted = as.integer(as.vector(h2o.predict(h2o.getModel(x), newdata = test)$predict))
+	# 	original = as.integer(as.vector(test$Y))
+	# 	print(performance(predicted = predicted, original = original))
+	# })
+	grid = h2o.getGrid(grid@grid_id, sort_by = 'logloss', decreasing = FALSE)
+	print(h2o.getModel(grid@model_ids[[1]])@model$model_summary)
+	predicted = as.integer(as.vector(h2o.predict(h2o.getModel(grid@model_ids[[1]]), newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+
+# # # gradient boosting # # #
+	print("# # # gradient boosting # # #")
+	fit = h2o.gbm(x = x, y = y, training_frame = train, ntrees = 400, distribution = 'bernoulli',
+		learn_rate = 0.5, learn_rate_annealing = 0.99, score_tree_interval = 5,
+		balance_classes = TRUE,
+		class_sampling_factors = c(0.2, 1), stopping_tolerance = 0.00005, stopping_metric = 'AUC', stopping_rounds = 10)
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+
+	print("# # important features in gbm # #")
+	impFeatures = fit@model$variable_importances$variable[fit@model$variable_importances$percentage >= 0.01]
+	impData = train[, c(impFeatures, y)]
+	imp_x = setdiff(colnames(impData), y)
+	fit = h2o.gbm(x = imp_x, y = y, training_frame = impData, ntrees = 100, distribution = 'bernoulli',
+		learn_rate = 0.5, learn_rate_annealing = 0.99, score_tree_interval = 5,
+		balance_classes = TRUE,
+		class_sampling_factors = c(0.5, 1))
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+	print("# # tuning parameters in gbm # #")
+	hyper_parameters = list(sample_rate = c(0.5, 0.75, 1), col_sample_rate = c(0.6, 0.8, 1))
+	# hyper_parameters = list(ntrees = seq(100, 1000, 100))
+	ntrees = 400
+	grid = h2o.grid("gbm", 
+		hyper_params = hyper_parameters, 
+		y = y, 
+		x = x, # removing target
+		distribution="bernoulli",
+		training_frame = train, 
+		validation_frame = valid,
+		ntrees = ntrees,
+		# learn_rate = as.numeric(2/ntrees),
+		max_depth = 4,
+		learn_rate = 0.5,
+		learn_rate_annealing = 0.99,
+		balance_classes = TRUE,
+		class_sampling_factors = c(0.2, 1)
+	)
+	grid = h2o.getGrid(grid@grid_id, sort_by = 'logloss')
+	print(h2o.getModel(grid@model_ids[[1]])@model$model_summary)
+	predicted = as.integer(as.vector(h2o.predict(h2o.getModel(grid@model_ids[[1]]), newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+	# # tuning gbm - Part: 2 # #
+	print("# # tuning gbm - Part: 2 # #")
+	ntrees_opts = c(10000)       # early stopping will stop earlier
+	max_depth_opts = seq(1,20)
+	min_rows_opts = c(1,5,10,20,50,100)
+	learn_rate_opts = seq(0.001,0.01,0.001)
+	sample_rate_opts = seq(0.3,1,0.05)
+	col_sample_rate_opts = seq(0.3,1,0.05)
+	col_sample_rate_per_tree_opts = seq(0.3,1,0.05)
+	nbins_cats_opts = seq(100,10000,100)
+
+	hyper_params = list( ntrees = ntrees_opts, 
+	max_depth = max_depth_opts, 
+	min_rows = min_rows_opts, 
+	learn_rate = learn_rate_opts,
+	sample_rate = sample_rate_opts,
+	col_sample_rate = col_sample_rate_opts,
+	col_sample_rate_per_tree = col_sample_rate_per_tree_opts,
+	nbins_cats = nbins_cats_opts
+	)
+
+	search_criteria = list(strategy = "RandomDiscrete", max_runtime_secs = 600, max_models = 100, stopping_metric = "AUTO", 
+	stopping_tolerance = 0.00001, stopping_rounds = 5, seed = 123456)
+
+	gbm_grid <- h2o.grid("gbm", grid_id = "gbm_tune_2", x = x, y = y, training_frame = train, validation_frame = valid, distribution="bernoulli",
+	stopping_rounds = 2, stopping_tolerance = 1e-3, stopping_metric = "MSE", 
+	score_tree_interval = 100, seed = 123456, hyper_params = hyper_params, search_criteria = search_criteria)
+
+	grid = h2o.getGrid(grid@grid_id, sort_by = 'logloss')
+	print(h2o.getModel(grid@model_ids[[1]])@model$model_summary)
+	predicted = as.integer(as.vector(h2o.predict(h2o.getModel(grid@model_ids[[1]]), newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+# # # deep learning # # #
+	print("# # # deep learning # # #")
+	fit = h2o.deeplearning(x = x, y = y, training_frame = train, validation_frame = valid, activation = 'RectifierWithDropout',
+		variable_importanc = TRUE, epochs = 100, hidden = c(100, 100), balance_classes = TRUE, class_sampling_factors = c(0.2, 1),
+		distribution = 'bernoulli', stopping_rounds = 10, stopping_metric = 'logloss', stopping_tolerance = 1e-5, rate = 0.5, rate_annealing = 0.99)
+	predicted = as.integer(as.vector(h2o.predict(fit, newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+	# # tuning deep learning # #
+	print("# # tuning deep learning # #")
+	hyper_params1 = list(input_dropout_ratio = c(0, 0.15, 0.3),
+		hidden_dropout_ratios = list(0, 0.15, 0.3),
+		hidden = list(64)
+	)
+
+	hyper_params2 = list(input_dropout_ratio = c(0, 0.15, 0.3),
+		hidden_dropout_ratios = list(c(0, 0), c(0.15, 0.15),c(0.3, 0.3)),
+		hidden = list(c(32,32))
+	)
+
+	grid = h2o.grid("deeplearning", x = x, y = y, training_frame = train, validation_frame = valid,
+	grid_id = "dl_tuned",
+	hyper_params = hyper_params1, adaptive_rate = TRUE,
+	variable_importances = TRUE, epochs = 50, stopping_rounds=5,
+	stopping_tolerance = 0.01, activation = c("RectifierWithDropout"),
+	seed = 1, reproducible = TRUE)
+
+	grid = h2o.grid("deeplearning", x = x, y = y, training_frame = train, validation_frame = valid,
+	grid_id = "dl_tuned",
+	hyper_params = hyper_params2, adaptive_rate = TRUE,
+	variable_importances = TRUE, epochs = 50, stopping_rounds=5,
+	stopping_tolerance = 0.01, activation = c("RectifierWithDropout"),
+	seed = 1, reproducible = TRUE)
+
+	grid = h2o.getGrid(grid@grid_id, sort_by = 'logloss')
+	print(h2o.getModel(grid@model_ids[[1]])@model$model_summary)
+	predicted = as.integer(as.vector(h2o.predict(h2o.getModel(grid@model_ids[[1]]), newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+	# # tuning deep learning - part: 2 # #
+	print("# # tuning deep learning - part: 2 # #")
+	activation_opt = c("Rectifier", "RectifierWithDropout", "Maxout", "MaxoutWithDropout")
+	hidden_opt = list(c(10, 10),c(20, 15),c(50, 50, 50))
+	l1_opt = c(0, 1e-3, 1e-5)
+	l2_opt = c(0, 1e-3, 1e-5)
+
+	hyper_params = list( activation=activation_opt,
+		hidden=hidden_opt,
+		l1=l1_opt,
+		l2=l2_opt
+	)
+	search_criteria = list(strategy = "RandomDiscrete", max_models=10)
+
+	grid = h2o.grid("deeplearning"
+		, grid_id = "deep_learn"
+		, hyper_params = hyper_params
+		, search_criteria = search_criteria
+		, training_frame = train
+		, validation_frame = valid
+		, x = x
+		, y = y
+		, epochs = 100
+		, variable_importances = TRUE, stopping_rounds=5
+		, stopping_tolerance = 0.01, seed = 1, reproducible = TRUE
+	)
+
+	grid = h2o.getGrid(grid@grid_id, sort_by = 'logloss')
+	print(h2o.getModel(grid@model_ids[[1]])@model$model_summary)
+	predicted = as.integer(as.vector(h2o.predict(h2o.getModel(grid@model_ids[[1]]), newdata = test)$predict))
+	original = as.integer(as.vector(test$Y))
+	print(performance(predicted = predicted, original = original))
+
+
+# # # xgboost # # #
+	print("# # # xgboost # # #")
+	library(Matrix)
+	library(xgboost)
+	# # one hot encoding
+	train_matrix = sparse.model.matrix(Y ~. -1, data = o_train)
+	test_matrix = sparse.model.matrix(Y ~. -1, data = o_test)
+	valid_matrix = sparse.model.matrix(Y ~. -1, data = o_valid)
+	# # form DMatrix to send as input to xgboost
+	dtrain = xgb.DMatrix(data = as.matrix(train_matrix), label = as.numeric(as.character(train$Y)))
+	dtest = xgb.DMatrix(data = as.matrix(test_matrix), label = as.numeric(as.character(test$Y)))
+	dvalid = xgb.DMatrix(data = as.matrix(valid_matrix), label = as.numeric(as.character(valid$Y)))
+	# # store output
+	original = as.numeric(as.character(as.vector(train$Y)))
+	print("# # basic xgboost # #")
+	hyper_params = list(booster = "gbtree", # default
+		objective = "binary:logistic",
+		eta = 0.01,
+		gamma = 1,
+		scale_pos_weight = 85,
+		max_depth = 3,
+		min_child_weight = 1, # default
+		subsample = 0.5,
+		colsample_bytree = 0.5
+	)
+	watchlist = list(eval = dvalid, train = dtrain)
+	fit = xgb.train(param = hyper_params, data = dtrain, nrounds = 100, print_every_n = 10, watchlist = watchlist)
+	predicted = predict(fit, dtest)
+	# cutoff = getCutoff(probabilities, original, plotROC = FALSE, all = FALSE)
+	cutoff = 0.5
+	original = as.integer(as.character(test$Y))
+	print(performance(predicted = as.numeric(predicted >= cutoff), original = original))
+
+	# # tuning parameters # #
+	searchGridSubCol = expand.grid(subsample = c(0.5, 0.75, 1), colsample_bytree = c(0.6, 0.8, 1))
+	ntrees = 100
+	errors = apply(searchGridSubCol, 1, function(parameterList){
+		# Extract Parameters to test
+		currentSubsampleRate = parameterList[["subsample"]]
+		currentColsampleRate = parameterList[["colsample_bytree"]]
+
+		fit = xgb.cv(data =  dtrain, nrounds = ntrees, nfold = 5, showsd = TRUE, verbose = TRUE,
+			"eval_metric" = "auc", "objective" = "binary:logistic", "max_depth" = 15, "eta" = 2/ntrees,
+			"subsample" = currentSubsampleRate, "colsample_bytree" = currentColsampleRate,
+			watchlist = watchlist, print_every_n = 10)
+		predicted = predict(fit, dtest)
+		# cutoff = getCutoff(probabilities, original, plotROC = FALSE, all = FALSE)
+		cutoff = 0.5
+		original = as.integer(as.character(test$Y))
+		perf = performance(predicted = as.numeric(predicted >= cutoff), original = original)
+
+		auc_scores = as.data.frame(fit$evaluation_log)
+		# Save rmse of the last iteration
+		auc = cbind(tail(auc_scores, 1), subsample = currentSubsampleRate, colsample_bytree = currentColsampleRate)
+
+		return(perf = cbind(auc, perf))
+	})
